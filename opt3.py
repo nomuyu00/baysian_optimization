@@ -13,7 +13,11 @@ def styblinski_tang(x):
     return 0.5 * torch.sum(x ** 4 - 16 * x ** 2 + 5 * x, dim=-1)
 
 
-global_optimum = -39.16599 * 25
+def rosenbrock(x):
+    return torch.sum(100.0 * (x[..., 1:] - x[..., :-1]**2)**2 + (1 - x[..., :-1])**2, dim=-1)
+
+
+global_optimum = 0.0
 
 
 def generate_initial_points(n_initial, dim, bounds):
@@ -33,13 +37,14 @@ class DropoutMixBO:
         self.bounds = bounds
         self.dropout_prob = dropout_prob
         self.X = generate_initial_points(n_initial, dim, bounds)
-        self.Y = styblinski_tang(self.X)
+        self.Y = rosenbrock(self.X)
         self.best_f = self.Y.min().item()
         self.best_x = self.X[self.Y.argmin()]
         self.eval_history = [self.best_f] * n_initial
 
     def optimize(self, n_iter):
         for _ in range(n_iter):
+            # 全次元からランダムにactive_dim個選ぶ
             active_dims = np.random.choice(self.dim, self.active_dim, replace=False)
 
             train_X = self.X[:, active_dims]
@@ -56,13 +61,17 @@ class DropoutMixBO:
 
             x_new = torch.zeros(self.dim)
             if np.random.random() < self.dropout_prob:
-                x_new = torch.rand(self.dim) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+                x_new[active_dims] = candidate.squeeze()
+                inactive_dims = np.setdiff1d(range(self.dim), active_dims)
+                x_new[inactive_dims] = (torch.rand(len(inactive_dims))
+                                        * (self.bounds[1][inactive_dims] - self.bounds[0][inactive_dims])
+                                        + self.bounds[0][inactive_dims])
             else:
                 x_new[active_dims] = candidate.squeeze()
                 x_new[np.setdiff1d(range(self.dim), active_dims)] = self.best_x[
                     np.setdiff1d(range(self.dim), active_dims)]
 
-            y_new = styblinski_tang(x_new.unsqueeze(0))
+            y_new = rosenbrock(x_new.unsqueeze(0))
 
             self.X = torch.cat([self.X, x_new.unsqueeze(0)])
             self.Y = torch.cat([self.Y, y_new])
@@ -84,7 +93,7 @@ class REMBO:
         self.A = torch.randn(high_dim, low_dim)
         self.X = torch.randn(n_initial, low_dim) * 2 - 1
         self.X_high = torch.clamp(torch.matmul(self.X, self.A.t()), bounds[0], bounds[1])
-        self.Y = styblinski_tang(self.X_high)
+        self.Y = rosenbrock(self.X_high)
         self.best_f = self.Y.min().item()
         self.best_x = self.X_high[self.Y.argmin()]
         self.eval_history = [self.best_f] * n_initial
@@ -106,7 +115,7 @@ class REMBO:
             x_low = candidate.squeeze()
             x_high = torch.clamp(torch.matmul(x_low.unsqueeze(0), self.A.t()), self.bounds[0], self.bounds[1]).squeeze()
 
-            y_new = styblinski_tang(x_high.unsqueeze(0))
+            y_new = rosenbrock(x_high.unsqueeze(0))
 
             self.X = torch.cat([self.X, x_low.unsqueeze(0)])
             self.X_high = torch.cat([self.X_high, x_high.unsqueeze(0)])
@@ -126,7 +135,7 @@ class LINEBO:
         self.dim = dim
         self.bounds = bounds
         self.X = generate_initial_points(n_initial, dim, bounds)
-        self.Y = styblinski_tang(self.X)
+        self.Y = rosenbrock(self.X)
         self.best_f = self.Y.min().item()
         self.best_x = self.X[self.Y.argmin()]
         self.eval_history = [self.best_f] * n_initial
@@ -145,7 +154,7 @@ class LINEBO:
             )
 
             x_new = candidate.squeeze()
-            y_new = styblinski_tang(x_new.unsqueeze(0))
+            y_new = rosenbrock(x_new.unsqueeze(0))
 
             self.X = torch.cat([self.X, x_new.unsqueeze(0)])
             self.Y = torch.cat([self.Y, y_new])
@@ -164,7 +173,7 @@ dim = 25
 active_dim = 5
 bounds = torch.tensor([[-5.0] * dim, [5.0] * dim])
 n_initial = 200
-n_iter = 3000
+n_iter = 100
 
 dropout_bo = DropoutMixBO(dim, active_dim, bounds, n_initial)
 rembo = REMBO(dim, active_dim, bounds, n_initial)
