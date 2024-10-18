@@ -17,7 +17,7 @@ from gpytorch import constraints
 
 
 def styblinski_tang(x):
-    indices = [2, 3, 5, 7, 9]
+    indices = [0, 1, 2, 3, 4]
     x_selected = x[..., indices]
     return 0.5 * torch.sum(x_selected ** 4 - 16 * x_selected ** 2 + 5 * x_selected, dim=-1)
 
@@ -51,6 +51,7 @@ class DropoutMixEST1BO:
         self.eval_history = [self.best_f] * n_initial  # 評価履歴を初期化
         self.improvement_history = [] # 報酬の履歴を初期化
         self.iteration = 0  # 現在のイテレーション
+        self.arm_counts = np.zeros(dim)  # 各次元の選択回数
 
         # CSARアルゴリズムの初期化
         self.N = list(range(self.dim))  # 全次元の集合
@@ -64,8 +65,9 @@ class DropoutMixEST1BO:
 
     def EST1(self, N_t, k, epsilon_t, delta_t):
         n = len(N_t)
-        m = int((2 / epsilon_t ** 2) * np.log(2 * n / delta_t))  # サンプル数を計算
-        # N_tをサイズ2kの部分集合に分割
+        # サンプル数を計算（m は 1 としていますが、必要に応じて調整してください）
+        m = 1
+        # N_t をサイズ 2k の部分集合に分割
         num_subsets = int(np.ceil(n / (2 * k)))
         subsets = []
         for i in range(num_subsets):
@@ -81,11 +83,11 @@ class DropoutMixEST1BO:
 
         # 各部分集合について推定を行う
         for subset in subsets:
-            # サイズ2kのハダマード行列を作成
+            # サイズ 2k のハダマード行列を作成
             H = self.create_hadamard(2 * k)
             Z_hat = np.zeros(2 * k)
 
-            # subset内の次元をN_tのインデックスにマッピング
+            # subset 内の次元を N_t のインデックスにマッピング
             subset_indices = [N_t.index(dim) for dim in subset]
 
             # ハダマード行列に従って部分集合をサンプリング
@@ -103,11 +105,20 @@ class DropoutMixEST1BO:
 
                 for l in range(m):
                     # 正の次元の報酬をサンプリング
-                    pos_sample = self.predict_without_x(pos_dims)
-                    pos_samples.append(pos_sample)
+                    if len(pos_dims) > 0:
+                        pos_sample = self.predict_without_x(pos_dims)
+                        pos_samples.append(pos_sample)
+                    else:
+                        # pos_dims が空の場合、デフォルト値を使用（例として0を使用）
+                        pos_samples.append(0)
+
                     # 負の次元の報酬をサンプリング
-                    neg_sample = self.predict_without_x(neg_dims)
-                    neg_samples.append(neg_sample)
+                    if len(neg_dims) > 0:
+                        neg_sample = self.predict_without_x(neg_dims)
+                        neg_samples.append(neg_sample)
+                    else:
+                        # neg_dims が空の場合、デフォルト値を使用（例として0を使用）
+                        neg_samples.append(0)
 
                 # 正の次元と負の次元の報酬の平均を計算
                 mu_pos = np.mean(pos_samples) if len(pos_samples) > 0 else 0
@@ -121,7 +132,7 @@ class DropoutMixEST1BO:
             # ハダマード行列を用いて次元ごとの報酬を推定
             theta_subset = (1 / (2 * k)) * H.T @ Z_hat
 
-            # 推定された報酬をtheta_hatに反映し、出現回数を更新
+            # 推定された報酬を theta_hat に反映し、出現回数を更新
             for idx, dim_idx in enumerate(subset_indices):
                 theta_hat[dim_idx] += theta_subset[idx]
                 counts[dim_idx] += 1
@@ -154,6 +165,8 @@ class DropoutMixEST1BO:
         return y_pred
 
     def predict_without_x(self, active_dims):
+
+        self.arm_counts[active_dims] += 1
         # GPモデルを使用して予測を行う
         train_X = self.X[:, active_dims].float()
         train_Y = self.Y.unsqueeze(-1).float()
@@ -223,10 +236,16 @@ class DropoutMixEST1BO:
                 theta_k = theta_hat_t[sorted_indices[self.active_dim - 1]]
                 theta_k_plus_1 = theta_hat_t[sorted_indices[self.active_dim]] if len(sorted_dims) > self.active_dim else -np.inf
 
-                A = [sorted_dims[i] for i in range(len(sorted_dims)) if theta_hat_t[sorted_indices[i]] - theta_k_plus_1 > 2 * self.epsilon_t]
-                R = [sorted_dims[i] for i in range(len(sorted_dims)) if theta_k - theta_hat_t[sorted_indices[i]] > 2 * self.epsilon_t]
+                # A = [sorted_dims[i] for i in range(len(sorted_dims)) if theta_hat_t[sorted_indices[i]] - theta_k_plus_1 > 2 * self.epsilon_t]
+                # R = [sorted_dims[i] for i in range(len(sorted_dims)) if theta_k - theta_hat_t[sorted_indices[i]] > 2 * self.epsilon_t]
 
-                self.accepted_dims.extend(A)
+                # m = 1 のときのepsilon_t
+                epsilon_m1 = np.sqrt(2 * np.log(len(self.remaining_dims) / self.delta_t) )
+
+                A = []
+                R = [sorted_dims[i] for i in range(len(sorted_dims)) if theta_k - theta_hat_t[sorted_indices[i]] > 2 * epsilon_m1]
+
+                #self.accepted_dims.extend(A)
                 self.rejected_dims.extend(R)
                 self.remaining_dims = [dim for dim in self.remaining_dims if dim not in A and dim not in R]
 
@@ -247,9 +266,6 @@ class DropoutMixEST1BO:
 
             active_dims = active_dims[:self.active_dim]  # 必要に応じて調整
 
-            # 報酬を計算
-            improvement = self.predict_without_x(active_dims)
-
             # 次のイテレーションのためにリセット
             self.remaining_dims = self.N.copy()
             self.accepted_dims = []
@@ -265,9 +281,11 @@ dim = 10
 active_dim = 2
 bounds = torch.tensor([[-5.0] * dim, [5.0] * dim])
 n_initial = 200
-n_iter = 5
+n_iter = 2
 
 dropout_bandit_est1 = DropoutMixEST1BO(dim, active_dim, bounds, n_initial, styblinski_tang, dropout_prob=0.0)
 
 dropout_bandit_est1_best_x, dropout_bandit_est1_best_f = dropout_bandit_est1.optimize(n_iter)
+
+print()
 

@@ -11,12 +11,26 @@ import matplotlib.pyplot as plt
 
 torch.set_default_dtype(torch.double)
 
-def styblinski_tang(x):
-    indices = [0, 1, 2, 3, 4]
-    x_selected = x[..., indices]
-    return 0.5 * torch.sum(x_selected ** 4 - 16 * x_selected ** 2 + 5 * x_selected, dim=-1)
 
-global_optimum = -39.16599 * 5
+def ackley(x):
+    indices = [0, 1, 2, 3, 4]
+    x = x[..., indices]
+    n = x.shape[-1]
+    sum_x_squared = torch.sum(x ** 2, dim=-1) / n
+    sum_cos_2pi_x = torch.sum(torch.cos(2 * math.pi * x), dim=-1) / n
+
+    term1 = 20 - 20 * torch.exp(-0.2 * torch.sqrt(sum_x_squared))
+    term2 = math.e - torch.exp(sum_cos_2pi_x)
+
+    return term1 + term2
+
+
+# 関数の探索範囲
+x_min = -32.768
+x_max = 32.768
+
+# 最適解（画像の情報に基づく）
+global_optimum = 0
 
 def generate_initial_points(n_initial, dim, bounds):
     return torch.rand(n_initial, dim) * (bounds[1] - bounds[0]) + bounds[0]
@@ -34,7 +48,7 @@ import numpy as np
 
 
 class ECI_BO_Bandit:
-    def __init__(self, X, objective_function, bounds, n_initial, n_max, dim):
+    def __init__(self, X, objective_function, bounds, n_initial, n_max, dim, gamma=0.99):
         self.objective_function = objective_function
         self.bounds = bounds  # Should be a list of tensors: [lower_bounds, upper_bounds]
         self.n_initial = n_initial
@@ -45,10 +59,12 @@ class ECI_BO_Bandit:
         self.best_value = None
         self.best_point = None
         self.model = None
+        self.gamma = 1
 
         # Bandit algorithm parameters
-        self.dimension_counts = [0] * self.dim  # Number of times each dimension was selected
+        self.dimension_counts = [1] * self.dim  # Number of times each dimension was selected
         self.dimension_rewards = [0.0] * self.dim  # Cumulative rewards for each dimension
+        self.squared_reward = [0.0] * self.dim  # Cumulative squared rewards for each dimension
 
         self.eval_history = [self.best_value] * n_initial
         self.arm_selection_history = []
@@ -61,7 +77,7 @@ class ECI_BO_Bandit:
 
     def normalize_rewards(self, rewards):
         if isinstance(rewards, (int, float)):
-            return 1  # 単一の値の場合はそのまま返す
+            return rewards  # 単一の値の場合はそのまま返す
         min_reward = min(rewards)
         max_reward = max(rewards)
         if min_reward == max_reward:
@@ -78,16 +94,20 @@ class ECI_BO_Bandit:
         # Calculate initial ECI values and normalize them
         eci_values = self.calculate_eci()
         self.dimension_rewards = self.normalize_rewards(eci_values)
+        self.squared_reward = [r ** 2 for r in self.dimension_rewards]
 
     def select_dimension(self, total_iterations):
+        # for i in range(self.dim):
+        #     if self.dimension_counts[i] == 1:
+        #         # Ensure each dimension is selected at least once
+        #         return i
         # UCB calculation
         ucb_values = []
         for i in range(self.dim):
-            if self.dimension_counts[i] == 0:
-                # Ensure each dimension is selected at least once
-                return i
             average_reward = self.dimension_rewards[i] / self.dimension_counts[i]
-            confidence = math.sqrt(2 * math.log(total_iterations) / self.dimension_counts[i])
+            var = self.squared_reward[i] / self.dimension_counts[i] - average_reward ** 2
+            confidence = math.sqrt(2 * var * math.log(total_iterations) / self.dimension_counts[i]) + 3 * math.log(
+                total_iterations) / self.dimension_counts[i]
             ucb = average_reward + confidence
             ucb_values.append(ucb)
         # Select dimension with highest UCB
@@ -160,11 +180,15 @@ class ECI_BO_Bandit:
             self.Y = torch.cat([self.Y, new_y])
 
             improvement = max(0, self.best_value - new_y.item())
+            if improvement == 0:
+                improvement = 0
+            else:
+                improvement = 1
 
-            # Calculate reward (improvement)
-
-            self.dimension_rewards = torch.tensor(self.dimension_rewards)
-            self.dimension_rewards[selected_dim] += self.normalize_rewards(improvement)
+            self.dimension_rewards = self.gamma * torch.tensor(self.dimension_rewards)
+            self.dimension_rewards[selected_dim] += improvement
+            self.squared_reward = self.gamma * torch.tensor(self.squared_reward)
+            self.squared_reward[selected_dim] += improvement ** 2
 
             # Update best value and point if improvement is found
             if new_y.item() < self.best_value:
@@ -174,34 +198,36 @@ class ECI_BO_Bandit:
             self.eval_history.append(self.best_value)
 
             # Update bandit statistics
-            self.dimension_counts = torch.tensor(self.dimension_counts)
+            self.dimension_counts = self.gamma * torch.tensor(self.dimension_counts)
             self.dimension_counts[selected_dim] += 1
 
             n += 1
             total_iterations += 1
-            print(n)
+            print(f"Iteration {n}, Best value: {self.best_value} ")
 
         return self.best_point, self.best_value
 
 
 # Parameters
-dim = 10
+dim = 100
 bounds = torch.tensor([[-5.0] * dim, [5.0] * dim])
 n_initial = 200
-n_iter = 210
+n_iter = 300
 n_runs = 1
 
 X = generate_initial_points(n_initial, dim, bounds)
 
 # 複数回の実行結果を格納するリスト
 all_histories = []
+selection_histories = []
 
 # Run the optimization
 
 for run in range(n_runs):
-    eci_bo = ECI_BO_Bandit(X, styblinski_tang, bounds, n_initial, n_iter, dim)
+    eci_bo = ECI_BO_Bandit(X, ackley, bounds, n_initial, n_iter, dim)
     best_x, best_f = eci_bo.optimize()
     all_histories.append(eci_bo.eval_history)
+    selection_histories.append(eci_bo.arm_selection_history)
 
 
 # 全実行の平均を計算
@@ -231,5 +257,7 @@ plt.title(f"All Optimization Results ({n_runs} runs)")
 plt.legend()
 plt.grid(True)
 plt.show()
+
+print(selection_histories)
 
 print(eci_bo.arm_selection_history)
