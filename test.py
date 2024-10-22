@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.special import softmax
 import matplotlib.pyplot as plt
 import seaborn as sns
+import math
 
 # ランダムシードの設定
 random.seed(42)
@@ -41,206 +42,189 @@ def create_model(train_X, train_Y):
     return model
 
 
-class DropoutMixBO_BC:
-    def __init__(self, dim, active_dim, bounds, n_initial, obj_function, dropout_prob=0.0, epsilon=0.1,
-                 temperature=1e-3, reset_interval=1000, learning_rate=0.005, initial_beta=2.0, annealing_rate=1000):
-        # クラスの初期化
+class ECI_BO_Bandit:
+    def __init__(self, X, objective_function, bounds, n_initial, n_max, dim, active_dim, gamma=0.99):
+        self.objective_function = objective_function
+        self.bounds = bounds  # Should be a list of tensors: [lower_bounds, upper_bounds]
+        self.n_initial = n_initial
+        self.n_max = n_max
         self.dim = dim
         self.active_dim = active_dim
-        self.bounds = bounds
-        self.dropout_prob = dropout_prob
-        self.obj_function = obj_function
-        self.epsilon = epsilon
-        self.temperature = temperature
-        self.reset_interval = reset_interval
-        self.iteration = 0
-        self.learning_rate = learning_rate
-        self.initial_beta = initial_beta
-        self.annealing_rate = annealing_rate
+        self.X = X
+        self.Y = None
+        self.best_value = None
+        self.best_point = None
+        self.model = None
+        self.gamma = 1
 
-        # 初期点の生成と評価
-        initial_X = generate_initial_points(n_initial, dim, bounds)
-        initial_Y = obj_function(initial_X)
+        # Bandit algorithm parameters
+        self.dimension_counts = [1] * self.dim  # Number of times each dimension was selected
+        self.dimension_rewards = [0.0] * self.dim  # Cumulative rewards for each dimension
+        self.squared_reward = [0.0] * self.dim  # Cumulative squared rewards for each dimension
 
-        self.X = initial_X.double()
-        self.Y = initial_Y.double()
-
-        self.best_f = self.Y.min().item()
-        self.best_x = self.X[self.Y.argmin()]
-        self.eval_history = [self.best_f] * n_initial
-        self.improvement_history = []
-
-        self.arm_rewards = np.zeros(dim)
-        self.arm_counts = np.zeros(dim)
-        self.total_pulls = 0
-        self.dim_sensitivity = np.zeros(dim)
-
+        self.eval_history = [self.best_value] * n_initial
         self.arm_selection_history = []
 
-    def select_active_dims(self):
-        # 活性化する次元を選択
-        self.iteration += 1
+    def update_model(self):
+        kernel = ScaleKernel(RBFKernel(ard_num_dims=self.X.shape[-1]), noise_constraint=1e-5)
+        self.model = SingleTaskGP(self.X, self.Y, covar_module=kernel)
+        mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
+        fit_gpytorch_model(mll)
 
-        # UCBスコアに基づいて選択
-        ucb_scores = self.calculate_ucb_scores()
+    def normalize_rewards(self, rewards):
+        if isinstance(rewards, (int, float)):
+            return rewards  # 単一の値の場合はそのまま返す
+        min_reward = min(rewards)
+        max_reward = max(rewards)
+        if min_reward == max_reward:
+            return [1.0] * len(rewards)
+        return [(r - min_reward) / (max_reward - min_reward) for r in rewards]
 
-        # ソフトマックスの適用
-        probabilities = softmax(ucb_scores / self.temperature)
-        probabilities = np.nan_to_num(probabilities, nan=1.0 / self.dim, posinf=1.0, neginf=0.0)
-        probabilities = np.clip(probabilities, 1e-10, 1)
-        probabilities /= probabilities.sum()
+    def initialize(self):
+        self.Y = self.objective_function(self.X).unsqueeze(-1)
+        self.best_value = self.Y.min().item()
+        self.best_point = self.X[self.Y.argmin()]
+        self.update_model()
+        self.eval_history = [self.best_value] * self.n_initial
 
-        selected_arms = np.random.choice(self.dim, self.active_dim, replace=False, p=probabilities)
+        # Calculate initial ECI values and normalize them
+        eci_values = self.calculate_eci()
+        self.dimension_rewards = self.normalize_rewards(eci_values)
+        self.squared_reward = [r ** 2 for r in self.dimension_rewards]
 
-        # 選択された次元を記録
-        arm_selection = np.zeros(self.dim)
-        arm_selection[selected_arms] = 1
-        self.arm_selection_history.append(arm_selection)
-
-        return selected_arms
-
-    def calculate_ucb_scores(self):
-        # UCBスコアを計算
-        exploration_term = np.sqrt(2 * np.log(self.total_pulls + 1) / (self.arm_counts + 1e-5))
-        exploitation_term = self.arm_rewards / (self.arm_counts + 1e-5)
-
-        # アニーリングによるβの調整
-        beta = self.initial_beta * np.exp(-self.iteration / self.annealing_rate)
-
-        ucb_scores = exploitation_term + beta * exploration_term
-        return ucb_scores
-
-    def calculate_dimension_sensitivity(self, new_x, new_y):
-        # new_y を Tensor に変換
-        if not isinstance(new_y, torch.Tensor):
-            new_y = torch.tensor([new_y], dtype=torch.double)
-        # 新しいデータポイントを追加
-        X_new = torch.cat([self.X, new_x.unsqueeze(0)], dim=0)
-        Y_new = torch.cat([self.Y, new_y])
-
-        self.X = X_new
-        self.Y = Y_new
-
-        # NumPy配列に変換
-        X_np = self.X.cpu().numpy()
-        Y_np = self.Y.cpu().numpy()
-
-        sensitivities = np.zeros(self.dim)
+    def select_dimension(self, total_iterations):
+        # UCB calculation
+        ucb_values = []
         for i in range(self.dim):
-            sorted_indices = np.argsort(X_np[:, i])
-            sorted_x = X_np[sorted_indices, i]
-            sorted_y = Y_np[sorted_indices]
-            dx = np.diff(sorted_x)
-            dy = np.diff(sorted_y)
-            nonzero_dx = dx != 0
-            diffs = np.zeros_like(dx)
-            diffs[nonzero_dx] = dy[nonzero_dx] / dx[nonzero_dx]
-            sensitivities[i] = np.mean(np.abs(diffs))
+            if self.dimension_counts[i] == 0:
+                ucb_values.append(float('inf'))  # Ensure unselected dimensions are chosen first
+            else:
+                average_reward = self.dimension_rewards[i] / self.dimension_counts[i]
+                var = max(0, self.squared_reward[i] / self.dimension_counts[i] - average_reward ** 2)
+                confidence = math.sqrt(
+                    2 * var * math.log(total_iterations + 1) / self.dimension_counts[i]) + 3 * math.log(
+                    total_iterations + 1) / self.dimension_counts[i]
+                ucb = average_reward + confidence
+                ucb_values.append(ucb)
 
-        total_sensitivity = np.sum(sensitivities) + 1e-10
-        new_sensitivity = sensitivities / total_sensitivity
+        # Sort dimensions by UCB values
+        sorted_indices = sorted(range(self.dim), key=lambda k: ucb_values[k], reverse=True)
 
-        # 指数移動平均で感度を更新
-        alpha = 0.1
-        self.dim_sensitivity = alpha * new_sensitivity + (1 - alpha) * self.dim_sensitivity
+        # Select dimensions based on UCB values
+        selected_dims = []
+        while len(selected_dims) < self.active_dim:
+            remaining = self.active_dim - len(selected_dims)
+            selected_dims.extend(sorted_indices[:remaining])
+            sorted_indices = sorted_indices[remaining:] + sorted_indices[:remaining]
 
-    def update_bandit(self, selected_dims, y_new, y_pred):
-        # バンディットの更新
-        improvement = np.exp(-((y_pred - y_new) ** 2))
-        self.improvement_history.append(improvement)
+        return selected_dims
 
-        self.total_pulls += 1
-        for dim in selected_dims:
-            self.arm_counts[dim] += 1
-            arm_contribution = improvement * self.dim_sensitivity[dim] / (
-                    sum(self.dim_sensitivity[selected_dims]) + 1e-10)
-            self.arm_rewards[dim] += arm_contribution
+    def calculate_eci(self):
+        eci_values = []
+        for i in range(self.dim):
+            ei = ExpectedImprovement(self.model, best_f=self.best_value, maximize=False)
 
-    def optimize(self, n_iter):
-        # 最適化のメインループ
-        for _ in range(n_iter):
-            # 活性化する次元を選択
-            active_dims = self.select_active_dims()
+            def eci_func(x):
+                # x has shape [batch_size, q=1, d=1]
+                batch_size = x.shape[0]
+                full_x = self.best_point.clone().unsqueeze(0).expand(batch_size, -1).clone()
+                full_x[:, i] = x.view(-1)
+                full_x = full_x.unsqueeze(1)  # shape [batch_size, q=1, dim]
+                return ei(full_x)
 
-            # モデルの学習データを準備
-            train_X = self.X[:, active_dims]
-            train_Y = self.Y.unsqueeze(-1)
+            bound = torch.tensor([[self.bounds[0][i]], [self.bounds[1][i]]], device=self.X.device)
+            candidate, value = optimize_acqf(
+                eci_func, bound, q=1, num_restarts=10, raw_samples=100,
+            )
+            eci_values.append(value.item())
+        return eci_values
 
-            # ガウス過程モデルの作成とフィッティング
-            model = create_model(train_X, train_Y)
-            mll = ExactMarginalLogLikelihood(model.likelihood, model)
-            fit_gpytorch_model(mll)
+    def optimize(self):
+        self.initialize()
+        n = self.n_initial
+        total_iterations = 1  # For UCB calculation
 
-            # Expected Improvement (EI) 獲得関数の定義
-            EI = ExpectedImprovement(model, best_f=self.best_f, maximize=False)
-            bounds_active = torch.stack([self.bounds[0][active_dims], self.bounds[1][active_dims]]).double()
+        while n < self.n_max:
+            self.update_model()
+            print(f"Iteration {n}, reward: {self.dimension_rewards}")
 
-            # 獲得関数の最適化
-            candidate, _ = optimize_acqf(
-                EI, bounds=bounds_active, q=1, num_restarts=10, raw_samples=100,
-                options={"maxiter": 200, "batch_limit": 5}
+            # Select dimensions to optimize using the bandit algorithm
+            selected_dims = self.select_dimension(total_iterations)
+            self.arm_selection_history.append(selected_dims)
+            print(f"Selected dimensions: {selected_dims}")
+
+            # Optimize over the selected dimensions
+            ei = ExpectedImprovement(self.model, best_f=self.best_value, maximize=False)
+
+            def eci_func(x):
+                batch_size = x.shape[0]
+                full_x = self.best_point.clone().unsqueeze(0).expand(batch_size, -1).clone()
+                full_x[:, selected_dims] = x.view(batch_size, -1)
+                full_x = full_x.unsqueeze(1)
+                return ei(full_x)
+
+            # Bounds for the selected dimensions
+            bounds = torch.stack([
+                torch.tensor([self.bounds[0][i] for i in selected_dims]),
+                torch.tensor([self.bounds[1][i] for i in selected_dims])
+            ], dim=0).to(self.X.device)
+
+            # Optimize the acquisition function over the selected dimensions
+            candidate, acq_value = optimize_acqf(
+                eci_func,
+                bounds,
+                q=1,
+                num_restarts=10,
+                raw_samples=100,
             )
 
-            # 新しい候補点を構築
-            x_new = torch.zeros(self.dim, dtype=torch.double)
-            x_new[active_dims] = candidate.squeeze()
-            x_new[np.setdiff1d(range(self.dim), active_dims)] = self.best_x[
-                np.setdiff1d(range(self.dim), active_dims)]
+            # Construct the new point
+            new_x = self.best_point.clone()
+            new_x[selected_dims] = candidate.squeeze()
+            new_y = self.objective_function(new_x.unsqueeze(0)).unsqueeze(-1)
 
-            # ガウス過程モデルによる予測値の計算
-            with torch.no_grad():
-                y_pred = model(x_new[active_dims].unsqueeze(0)).mean.item()
+            # Update data
+            self.X = torch.cat([self.X, new_x.unsqueeze(0)])
+            self.Y = torch.cat([self.Y, new_y])
 
-            # 目的関数の評価
-            y_new = self.obj_function(x_new.unsqueeze(0))
-            if isinstance(y_new, torch.Tensor):
-                y_new = y_new.item()
+            improvement = max(0, self.best_value - new_y.item())
 
-            # 感度の更新
-            self.calculate_dimension_sensitivity(x_new, y_new)
+            # Update rewards and counts for selected dimensions
+            for dim in selected_dims:
+                self.dimension_rewards[dim] = self.gamma * self.dimension_rewards[dim] + improvement
+                self.squared_reward[dim] = self.gamma * self.squared_reward[dim] + improvement ** 2
+                self.dimension_counts[dim] += 1
 
-            # バンディットの更新
-            self.update_bandit(active_dims, y_new, y_pred)
+            # Update best value and point if improvement is found
+            if new_y.item() < self.best_value:
+                self.best_value = new_y.item()
+                self.best_point = new_x
 
-            # 最良値の更新
-            if y_new < self.best_f:  # item() を取り除く
-                self.best_f = y_new
-                self.best_x = x_new
+            self.eval_history.append(self.best_value)
 
-            # 評価履歴の更新
-            self.eval_history.append(self.best_f)
+            n += 1
+            total_iterations += 1
+            print(f"Iteration {n}, Best value: {self.best_value}")
 
-        # 次元選択の履歴をDataFrameに変換
-        self.arm_selection_df = pd.DataFrame(self.arm_selection_history,
-                                             columns=[f'Arm_{i}' for i in range(self.dim)])
-        self.arm_selection_df.index.name = 'Iteration'
-
-        return self.best_x, self.best_f
-
-    # 結果の保存と可視化
-    def save_arm_selection_history(self, filename):
-        self.arm_selection_df.to_csv(filename)
-
-    def plot_dim_sensitivity(self):
-        plt.figure(figsize=(12, 6))
-        plt.bar(range(self.dim), self.dim_sensitivity)
-        plt.xlabel('Dimension')
-        plt.ylabel('Sensitivity')
-        plt.title('Dimension Sensitivity')
-        plt.xticks(range(self.dim))
-        plt.grid(True)
-        plt.show()
+        return self.best_point, self.best_value
 
 
 # パラメータの設定
-dim = 10
+dim = 12
 active_dim = 5
 bounds = torch.tensor([[-5.0] * dim, [5.0] * dim])
 n_initial = 20
 n_iter = 50
 
-# インスタンスの作成と最適化の実行
-dropout_bandit_bc_ucb = DropoutMixBO_BC(dim, active_dim, bounds, n_initial, styblinski_tang, dropout_prob=0.0)
+X = generate_initial_points(n_initial, dim, bounds)
 
-dropout_bandit_bc_ucb_best_x, dropout_bandit_bc_ucb_best_f = dropout_bandit_bc_ucb.optimize(n_iter)
-dropout_bandit_bc_ucb.save_arm_selection_history('dropout_bandit_bc_ucb_arm_selection_binary.csv')
+eci_bo_bandit_history = []
+arm_selection_history = []
+
+# インスタンスの作成と最適化の実行
+eci_bo_bandit = ECI_BO_Bandit(X, styblinski_tang, bounds, n_initial, n_iter, dim, active_dim)
+best_x, best_f = eci_bo_bandit.optimize()
+eci_bo_bandit_history.append(eci_bo_bandit.eval_history)
+arm_selection_history.append(eci_bo_bandit.arm_selection_history)
+
+
