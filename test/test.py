@@ -163,7 +163,7 @@ class ECI_BO_Bandit:
         axes[1].axis("equal")
 
         plt.tight_layout()
-        plot_dir = "plots"
+        plot_dir = "../plots"
         os.makedirs(plot_dir, exist_ok=True)
         filename = os.path.join(plot_dir, f"gp_posterior_{iteration}.png")
         plt.savefig(filename)
